@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -16,9 +18,33 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
+    val keystoreProperties = Properties()
+    val keystorePropertiesFile = rootProject.file("keystore.properties")
+    if (keystorePropertiesFile.exists()) {
+        keystorePropertiesFile.inputStream().use { keystoreProperties.load(it) }
+    }
+
+    fun env(name: String): String? = System.getenv(name)?.takeIf { it.isNotBlank() }
+    val storeFilePath = keystoreProperties.getProperty("storeFile") ?: env("KEYSTORE_FILE")
+
+    signingConfigs {
+        create("release") {
+            val storeFilePath = keystoreProperties.getProperty("storeFile") ?: env("KEYSTORE_FILE")
+            if (!storeFilePath.isNullOrBlank()) {
+                storeFile = file(storeFilePath)
+                storePassword = keystoreProperties.getProperty("storePassword") ?: env("KEYSTORE_PASSWORD")
+                keyAlias = keystoreProperties.getProperty("keyAlias") ?: env("KEY_ALIAS")
+                keyPassword = keystoreProperties.getProperty("keyPassword") ?: env("KEY_PASSWORD")
+            }
+        }
+    }
 
     buildTypes {
         release {
+            // 关键：只有在拿到 storeFile 时才绑定，否则你本地/CI 没配会直接报错
+            if (!storeFilePath.isNullOrBlank()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
