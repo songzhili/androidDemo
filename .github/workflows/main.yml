@@ -3,21 +3,21 @@ name: PR Merge -> Tag + Release
 on:
   pull_request:
     branches: [ "main" ]
-    types: [ closed ]   # 只在 PR 关闭时触发（包含 merged / not merged）
+    types: [ closed ]
 
 jobs:
   release_on_merge:
-    if: ${{ github.event.pull_request.merged == true }}  # 只在“合并”时跑
+    if: ${{ github.event.pull_request.merged == true }}
     runs-on: ubuntu-latest
 
     permissions:
-      contents: write   # push tag + 创建 GitHub Release 需要
+      contents: write
 
     steps:
       - name: Checkout (full history for tags/changelog)
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }} # 确保就是合并后的 commit
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
           fetch-depth: 0
 
       - name: Set up JDK 17
@@ -34,16 +34,15 @@ jobs:
         run: chmod +x ./gradlew
 
       # ---------------------------
-      # 1) 自动生成 Tag
-      #   优先从 app/build.gradle 里读 versionName（Groovy 常见写法）
-      #   找不到就退化为 vYYYY.MM.DD.<run_number>
+      # 1) 自动生成 Tag（KTS 项目建议用 versionName = "x.y.z" 这种正则）
       # ---------------------------
       - name: Compute tag
         shell: bash
         run: |
           set -e
 
-          VERSION_NAME=$(grep -R --line-number -m 1 'versionName ' . | sed -E 's/.*versionName[[:space:]]+"([^"]+)".*/\1/' || true)
+          VERSION_NAME=$(grep -R --line-number -m 1 'versionName[[:space:]]*=' . 2>/dev/null \
+            | sed -E 's/.*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/' || true)
 
           if [[ -n "$VERSION_NAME" && "$VERSION_NAME" != *"versionName"* ]]; then
             TAG="v$VERSION_NAME"
@@ -61,7 +60,6 @@ jobs:
           git config user.name "github-actions"
           git config user.email "actions@github.com"
 
-          # 避免重复 tag（比如重跑 workflow）
           if git rev-parse "$TAG" >/dev/null 2>&1; then
             echo "Tag $TAG already exists. Skip creating tag."
           else
@@ -70,7 +68,7 @@ jobs:
           fi
 
       # ---------------------------
-      # 2) 解码 keystore（这里不在 if 表达式引用 secrets，避免你之前的 invalid workflow）
+      # 2) 解码 keystore
       # ---------------------------
       - name: Decode keystore
         shell: bash
@@ -79,35 +77,58 @@ jobs:
         run: |
           set -e
           if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
-            echo "ERROR: ANDROID_KEYSTORE_BASE64 is not set. Cannot build signed release."
+            echo "ERROR: ANDROID_KEYSTORE_BASE64 is not set."
             exit 1
           fi
           echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > keystore.jks
-          echo "Keystore decoded."
+          ls -lh keystore.jks
 
       # ---------------------------
-      # 3) 构建 Release APK + AAB
+      # 3) 诊断：签名报告（最关键）
       # ---------------------------
-      - name: Build Release APK & AAB
+      - name: Signing report (must show release signing)
         env:
-          KEYSTORE_PATH: ${{ github.workspace }}/keystore.jks
-          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          CI: "true"
+          KEYSTORE_FILE: ${{ github.workspace }}/keystore.jks
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          ./gradlew clean assembleRelease bundleRelease --stacktrace
+          ./gradlew :app:signingReport --no-daemon
 
-      - name: Collect release files
+      # ---------------------------
+      # 4) 构建 Release APK + AAB（使用正确的 env 变量名）
+      # ---------------------------
+      - name: Build Release APK & AAB (SIGNED)
+        env:
+          CI: "true"
+          KEYSTORE_FILE: ${{ github.workspace }}/keystore.jks
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          ./gradlew clean :app:assembleRelease :app:bundleRelease --stacktrace --no-daemon
+
+      # ---------------------------
+      # 5) 只收集“已签名”的 APK（排除 *unsigned*） + AAB
+      # ---------------------------
+      - name: Collect release files (exclude unsigned)
         shell: bash
         run: |
           set -e
           mkdir -p release_out
 
-          APK=$(ls -1 **/build/outputs/apk/release/*.apk 2>/dev/null | head -n 1 || true)
-          AAB=$(ls -1 **/build/outputs/bundle/release/*.aab 2>/dev/null | head -n 1 || true)
+          echo "All APKs:"
+          find app/build/outputs/apk -type f -name "*.apk" -print || true
+          echo "All AABs:"
+          find app/build/outputs/bundle -type f -name "*.aab" -print || true
+
+          # 排除 unsigned
+          APK=$(find app/build/outputs/apk -type f -name "*.apk" ! -name "*unsigned*" | head -n 1 || true)
+          AAB=$(find app/build/outputs/bundle -type f -name "*.aab" | head -n 1 || true)
 
           if [ -z "$APK" ] && [ -z "$AAB" ]; then
-            echo "ERROR: No release APK/AAB found."
+            echo "ERROR: No signed release APK/AAB found."
             exit 1
           fi
 
@@ -118,14 +139,27 @@ jobs:
           ls -la release_out
 
       # ---------------------------
-      # 4) 自动生成 changelog（上一个 tag -> 当前 TAG）
+      # 6) 校验 APK 签名（如果没签名这里会失败）
+      # ---------------------------
+      - name: Verify APK signature
+        shell: bash
+        run: |
+          set -e
+          APK=$(ls -1 release_out/*.apk 2>/dev/null | head -n 1 || true)
+          if [ -n "$APK" ]; then
+            apksigner verify -v "$APK"
+          else
+            echo "No APK found in release_out (maybe only AAB)."
+          fi
+
+      # ---------------------------
+      # 7) changelog（上一个 tag -> 当前 TAG）
       # ---------------------------
       - name: Generate changelog
         shell: bash
         run: |
           set -e
 
-          # 找到上一个 tag（按创建时间/语义可能不同，这里用 git describe 方式）
           PREV_TAG=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)
 
           echo "Current tag: $TAG"
@@ -149,7 +183,7 @@ jobs:
           } > CHANGELOG.md
 
       # ---------------------------
-      # 5) 创建 GitHub Release + 上传 APK/AAB
+      # 8) 创建 GitHub Release + 上传产物
       # ---------------------------
       - name: Create GitHub Release (attach APK/AAB)
         uses: softprops/action-gh-release@v2
